@@ -1,6 +1,6 @@
 # oci-pax-helper-tool
 
-Helper tooling for packaging [Spectro Cloud Palette](https://www.spectrocloud.com/) packs and pushing them to a private **Amazon ECR** registry as OCI artifacts, using [ORAS](https://oras.land/).
+Helper tooling for packaging [Spectro Cloud Palette](https://www.spectrocloud.com/) packs and pushing them to a private OCI registry — **Amazon ECR** or a **Zot / basic OCI** registry — as OCI artifacts, using [ORAS](https://oras.land/).
 
 Use it to publish packs (e.g. from a local checkout of [`pack-central`](https://github.com/spectrocloud/pack-central) or `pax`) into your own ECR registry so you can add that registry to Palette and test the packs before opening a PR.
 
@@ -15,6 +15,13 @@ You need `aws`, `oras` (**v1.0.0 or later**), and `jq` installed, and an authent
 ```
 
 The script prints exactly what it will push and where, then asks for confirmation. That's it — the pack is now in your ECR registry.
+
+**…or push to a Zot registry** (the backend is auto-detected when `ZOT_HOST` is set):
+
+```bash
+ZOT_HOST=my-zot.example.com:30003 ZOT_USERNAME=admin ZOT_PASSWORD=… \
+  ./push-to-ecr.sh ../pack-central/packs/kata-deploy-3.32.0
+```
 
 **2. Push *and* sync Palette in one command (optional):**
 
@@ -47,7 +54,7 @@ See [Configuration](#configuration) and [Usage](#usage) below for all options.
 | Tool | Min version | Why | Needed for |
 |---|---|---|---|
 | [`oras`](https://oras.land/docs/installation) | **v1.0.0** | OCI registry client used to push packs | always |
-| [`aws` CLI](https://docs.aws.amazon.com/cli/) | v2 | ECR login, repo creation, account lookup | push |
+| [`aws` CLI](https://docs.aws.amazon.com/cli/) | v2 | ECR login, repo creation, account lookup | push to **ECR** only |
 | [`jq`](https://jqlang.github.io/jq/) | 1.6+ | reads `pack.json` and Palette API responses | always |
 | `tar` | system tar | packages the pack directory | push |
 | `curl` | system curl | calls the Palette API | `--sync` only |
@@ -119,9 +126,16 @@ Settings are resolved with the following precedence (highest first):
 
 | Setting | Env / `.env` key | Flag | Default |
 |---|---|---|---|
-| Registry namespace | `REGISTRY_NAME` | `-r`, `--registry` | `custeng-sa-oci` |
+| Push backend | `REGISTRY_BACKEND` | `--backend ecr\|zot` | auto (`zot` if `ZOT_HOST` set, else `ecr`) |
+| ECR registry namespace | `REGISTRY_NAME` | `-r`, `--registry` | `custeng-sa-oci` (ECR only) |
 | AWS region | `AWS_DEFAULT_REGION` | `--region` | `eu-west-2` |
 | Repo base path | `PACK_BASE_PATH` | `-b`, `--base-path` | `spectro-packs/archive` |
+| Zot host | `ZOT_HOST` | `--zot-host` | — |
+| Zot username | `ZOT_USERNAME` | `--zot-username` | — |
+| Zot password | `ZOT_PASSWORD` | *(secret — env/`.env` only)* | — |
+| Zot CA cert | `ZOT_CA_FILE` | `--ca-file` | — |
+| Skip TLS verify | — | `--insecure` | off |
+| Plain HTTP | — | `--plain-http` | off |
 | Palette API key | `PALETTE_API_KEY` | *(secret — env/`.env` only)* | — |
 | Palette host | `PALETTE_HOST` | `--palette-host` | `api.spectrocloud.com` |
 | Palette registry name | `PALETTE_REGISTRY_NAME` | `--registry-name` | — |
@@ -147,8 +161,14 @@ If no `PACK_DIR` is given, the current directory is used.
 
 | Option | Description |
 |---|---|
-| `-r`, `--registry NAME` | ECR registry namespace |
-| `--region REGION` | AWS region |
+| `--backend ecr\|zot` | Force the push backend (otherwise auto-detected from `ZOT_HOST`) |
+| `-r`, `--registry NAME` | ECR registry namespace (ECR only) |
+| `--region REGION` | AWS region (ECR only) |
+| `--zot-host HOST` | Zot registry host[:port] |
+| `--zot-username U` | Zot registry username |
+| `--ca-file PATH` | CA certificate for the Zot registry's TLS |
+| `--insecure` | Skip TLS verification (self-signed certs) |
+| `--plain-http` | Use plain HTTP (no TLS) |
 | `-b`, `--base-path PATH` | Repo base path under the registry |
 | `--lean` | Exclude the unpacked `charts/<chart>/` tree from the artifact (keeps `charts/*.tgz`) |
 | `-s`, `--sync` | Trigger a Palette registry sync after a successful push |
@@ -184,6 +204,36 @@ Override the target registry/region for one run:
 ```bash
 REGISTRY_NAME=my-registry ./push-to-ecr.sh --region us-east-1 ./mypack-1.0.0
 ```
+
+### Pushing to Zot (or any basic OCI registry)
+
+Set `ZOT_HOST` and credentials and the tool switches to the Zot backend automatically — no AWS needed, and repositories are created on push. Packs go to `<ZOT_HOST>/spectro-packs/archive/<name>:<version>` (no namespace prefix).
+
+Put the credentials in `.env` (recommended — keeps the password out of your shell history):
+
+```bash
+# .env
+ZOT_HOST="my-zot.example.com:30003"
+ZOT_USERNAME="admin"
+ZOT_PASSWORD="…"          # secret — never passed as a flag
+```
+
+```bash
+./push-to-ecr.sh -y ../pack-central/packs/*/
+```
+
+TLS options for Zot:
+
+```bash
+# HTTPS with a private CA
+./push-to-ecr.sh --ca-file /path/to/ca.crt -y ./mypack-1.0.0
+# HTTPS with a self-signed cert (skip verification)
+./push-to-ecr.sh --insecure -y ./mypack-1.0.0
+# plain HTTP (no TLS)
+./push-to-ecr.sh --plain-http -y ./mypack-1.0.0
+```
+
+> The backend is auto-detected from `ZOT_HOST`. Use `--backend ecr` to force ECR even if `ZOT_HOST` is present, or `--backend zot` to be explicit.
 
 ## Sync to Palette
 
@@ -221,19 +271,23 @@ Notes:
 
 ## Where packs land
 
-Packs are pushed to:
+**ECR:**
 
 ```
 <account-id>.dkr.ecr.<region>.amazonaws.com/<REGISTRY_NAME>/<PACK_BASE_PATH>/<name>:<version>
-```
-
-For example, `kata-deploy` v3.32.0 with the defaults:
-
-```
-<account-id>.dkr.ecr.eu-west-2.amazonaws.com/custeng-sa-oci/spectro-packs/archive/kata-deploy:3.32.0
+# e.g. <account-id>.dkr.ecr.eu-west-2.amazonaws.com/custeng-sa-oci/spectro-packs/archive/kata-deploy:3.32.0
 ```
 
 The account ID is derived automatically from your AWS credentials. The script creates the base-path repository and each per-pack repository if they don't already exist.
+
+**Zot:**
+
+```
+<ZOT_HOST>/<PACK_BASE_PATH>/<name>:<version>
+# e.g. my-zot.example.com:30003/spectro-packs/archive/kata-deploy:3.32.0
+```
+
+No namespace prefix is used, and Zot creates repositories automatically on push. Either way, the mandatory `spectro-packs/archive` path (Palette's expected namespace for custom OCI registries) is always present.
 
 ## Behaviour notes
 
